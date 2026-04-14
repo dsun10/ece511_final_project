@@ -1,0 +1,371 @@
+#ifndef __CPU_O3_ISSUE_QUEUE_HH__
+#define __CPU_O3_ISSUE_QUEUE_HH__
+
+#include <cstdint>
+#include <list>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <boost/compute/detail/lru_cache.hpp>
+#include <boost/dynamic_bitset/dynamic_bitset.hpp>
+#include <boost/heap/priority_queue.hpp>
+
+#include "base/statistics.hh"
+#include "base/stats/group.hh"
+#include "cpu/inst_seq.hh"
+#include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/reg_class.hh"
+#include "cpu/timebuf.hh"
+#include "params/BaseSelector.hh"
+#include "params/IssuePort.hh"
+#include "params/IssueQue.hh"
+#include "params/PAgeSelector.hh"
+#include "params/Scheduler.hh"
+#include "params/SpecWakeupChannel.hh"
+#include "sim/sim_object.hh"
+
+namespace gem5
+{
+
+class FUDesc;
+
+namespace o3
+{
+
+class FUPool;
+class CPU;
+class IEW;
+class Scheduler;
+class MemDepUnit;
+
+using ReadyQue = std::list<DynInstPtr>;
+using SelectQue = std::vector<std::pair<uint32_t, DynInstPtr>>;
+
+/**
+ *          insert into queue
+ *                 |
+ *                 V
+ *         speculative schedule <-------+
+ *                 |                    |
+ *                 V                    |
+ *      schedule (issueStage 0)   ------+
+ *                 |                    |
+ *                 V                    |
+ *       delay (issueStage n)     wake or cancel
+ *                 |                    |
+ *                 V                    |
+ *      issue success bypass datas      |
+ *                 |                    |
+ *                 V                    |
+ *              execute ----------------+
+ */
+
+class IssuePort : public SimObject
+{
+  public:
+    std::vector<int> rp;  // [typeid, portid]
+    std::vector<FUDesc*> fu;
+    std::bitset<Num_OpClasses> opbits;
+    IssuePort(const IssuePortParams& params);
+};
+
+class BaseSelector : public SimObject
+{
+    Scheduler* scheduler = nullptr;
+    IssueQue* iq = nullptr;
+  protected:
+    ReadyQue::iterator end;
+  public:
+    BaseSelector(const BaseSelectorParams& params) : SimObject(params) {}
+    virtual void setparent(Scheduler* scheduler, IssueQue* iq) { this->scheduler = scheduler; this->iq = iq; }
+    virtual void allocate(const DynInstPtr& inst) {}
+    virtual void deallocate(const DynInstPtr& inst) {}
+    void begin(ReadyQue* readyQ) { end = readyQ->end(); }
+    virtual ReadyQue::iterator select(ReadyQue::iterator begin, int portid);
+};
+
+class PAgeSelector : public BaseSelector
+{
+    std::deque<int> freelist;
+    SelectQue* iqselectQ = nullptr;
+    int numInstperGroup = 0;
+  public:
+    PAgeSelector(const PAgeSelectorParams& params) : BaseSelector(params), numInstperGroup(params.piece) {}
+    void setparent(Scheduler* scheduler, IssueQue* iq) override;
+    void allocate(const DynInstPtr& inst) override;
+    void deallocate(const DynInstPtr& inst) override;
+    ReadyQue::iterator select(ReadyQue::iterator begin, int portid) override;
+};
+
+class IssueQue : public SimObject
+{
+    friend class Scheduler;
+    friend class BaseSelector;
+    friend class PAgeSelector;
+
+    std::string _name;
+    const int inports;
+    const int outports;
+    const int iqsize;
+    const int replayQsize = 32;
+    const int scheduleToExecDelay;
+    const std::string iqname;
+    std::vector<std::bitset<Num_OpClasses>> portFuDescs;
+    std::vector<FUDesc*> fuDescs;
+    std::vector<bool> opPipelined;
+    int IQID = -1;
+
+    int numLoadPipe = 0;
+    int numStorePipe = 0;
+
+    struct select_policy
+    {
+        bool operator()(const DynInstPtr& a, const DynInstPtr& b) const;
+    };
+
+    struct IssueStream
+    {
+        int size;
+        DynInstPtr insts[8];
+        void push(const DynInstPtr& inst);
+        DynInstPtr pop();
+    };
+
+    std::vector<DynInstPtr> skidBuffer;
+    TimeBuffer<IssueStream> inflightIssues;
+    TimeBuffer<IssueStream>::wire toIssue;
+    TimeBuffer<IssueStream>::wire toFu;
+
+    std::list<DynInstPtr> instList;
+    uint64_t instNumInsert = 0;
+
+    std::vector<uint8_t*> instNumClassify;
+    uint64_t instNum = 0;
+
+    // issueport : regfileport : priority
+    std::vector<std::vector<std::pair<int, int>>> intRdRfTPI;
+    std::vector<std::vector<std::pair<int, int>>> fpRdRfTPI;
+
+    std::vector<std::vector<std::pair<int, int>>> intWrRfTPI;
+
+    std::vector<int64_t> portBusy;
+
+    // TX dynamic port optimization control
+    bool enableMainRdpOpt = false;
+
+    // opclass mapping to pipeid
+    std::vector<ReadyQue*> readyQclassify;
+    // s0: wakeup inst, add ready inst to readyInstsQue
+    std::vector<ReadyQue*> readyQs;
+    // s1: schedule readyInsts
+    SelectQue selectQ;
+
+    // srcIdx : inst
+    std::vector<std::vector<std::pair<uint8_t, DynInstPtr>>> subDepGraph;
+
+    std::queue<DynInstPtr> replayQ;  // only for mem
+
+    CPU* cpu = nullptr;
+    Scheduler* scheduler = nullptr;
+    BaseSelector* selector = nullptr;
+
+    struct IssueQueStats : public statistics::Group
+    {
+        IssueQueStats(statistics::Group* parent, IssueQue* que, std::string name);
+        statistics::Scalar retryMem;
+        statistics::Scalar canceledInst;
+        statistics::Scalar loadmiss;
+        statistics::Scalar arbFailed;
+        statistics::Scalar tagRefillBlock;
+        statistics::Scalar issueOccupy;
+        statistics::Vector insertDist;
+        statistics::Vector issueDist;
+        statistics::Vector portissued;
+        statistics::Vector portBusy;
+        statistics::Average avgInsts;
+    }* iqstats = nullptr;
+
+    void replay(const DynInstPtr& inst);
+    void addToFu(const DynInstPtr& inst);
+    bool checkScoreboard(const DynInstPtr& inst);
+    void issueToFu();
+    void wakeUpDependents(const DynInstPtr& inst, bool speculative);
+    void selectInst();
+    void scheduleInst();
+    void addIfReady(const DynInstPtr& inst);
+    void cancel(const DynInstPtr& inst);
+
+  public:
+    inline void clearBusy(uint32_t pi) { portBusy.at(pi) = 0; }
+
+    IssueQue(const IssueQueParams& params);
+    void setIQID(int id) { IQID = id; }
+    void setCPU(CPU* cpu);
+    void setMainRdpOpt(bool enable) { enableMainRdpOpt = enable; }
+    void resetDepGraph(int numPhysRegs);
+
+    void tick();
+    bool ready();
+    int emptyEntries() const { return iqsize - instNum; }
+    void insert(const DynInstPtr& inst);
+    void insertNonSpec(const DynInstPtr& inst);
+
+    void markMemDepDone(const DynInstPtr& inst);
+    /** move the mem inst to readyQ, and try it again. */
+    void retryMem(const DynInstPtr& inst);
+    bool idle();
+
+    void doCommit(const InstSeqNum inst);
+    void doSquash(const InstSeqNum seqNum);
+
+    int getIssueStages() { return scheduleToExecDelay; }
+    int getId() { return IQID; }
+    // return IQ's name
+    std::string getName() { return iqname; }
+    // return gem5 simobject's name
+    std::string name() const override { return _name; }
+};
+
+class SpecWakeupChannel : public SimObject
+{
+  public:
+    std::vector<std::string> srcIQs;
+    std::vector<std::string> dstIQs;
+    SpecWakeupChannel(const SpecWakeupChannelParams& params)
+        : SimObject(params), srcIQs(params.srcs), dstIQs(params.dsts)
+    {
+    }
+};
+
+class Scheduler : public SimObject
+{
+    friend class IssueQue;
+    class SpecWakeupCompletion;
+    // structured as <instruction seqNum -> [pending speculate wakeup events]>
+    using PendingWakeEventsType = std::unordered_map<uint64_t, std::unordered_set<SpecWakeupCompletion*>>;
+    class SpecWakeupCompletion : public Event
+    {
+      public:
+        DynInstPtr inst;
+        PendingWakeEventsType* owner;
+        IssueQue* to_issue_queue = nullptr;
+
+        SpecWakeupCompletion(const DynInstPtr& inst, IssueQue* to, PendingWakeEventsType* owner);
+        void process() override;
+        const char* description() const override;
+    };
+
+    CPU* cpu;
+    MemDepUnit* memDepUnit;
+    LSQ* lsq;
+    const int intel_fewops = 8;
+    bool old_disp = false;
+    const int intRegfileBanks;
+
+    struct SchedulerStats : public statistics::Group
+    {
+        SchedulerStats(statistics::Group* parent);
+        statistics::Scalar exec_stall_cycle;
+        statistics::Scalar memstall_any_load;
+        statistics::Scalar memstall_any_store;
+        statistics::Scalar memstall_l1miss;
+        statistics::Scalar memstall_l2miss;
+        statistics::Scalar memstall_l3miss;
+    } stats;
+
+    struct disp_policy
+    {
+        OpClass disp_op;
+        disp_policy(OpClass op) : disp_op(op) {}
+        bool operator()(IssueQue* a, IssueQue* b) const;
+    };
+    using IQGroup = std::vector<IssueQue*>;
+
+    std::vector<int> opExecTimeTable;
+    std::vector<bool> opPipelined;
+    std::vector<IQGroup> dispTable;
+    std::vector<IssueQue*> issueQues;
+    std::vector<std::vector<IssueQue*>> wakeMatrix;
+    uint32_t combinedFus;
+
+    std::vector<uint8_t> totalDispCounter;
+    std::vector<uint8_t*> dispOpdist;
+
+    std::vector<DynInstPtr> instsToFu;
+
+    std::vector<bool> earlyScoreboard;
+    std::vector<bool> bypassScoreboard;
+    std::vector<bool> scoreboard;
+
+    // typePortId : [inst : priority]
+    using OccupancyType = std::vector<std::pair<DynInstPtr, int>>;
+    std::vector<OccupancyType> rdRfPortOccupancy;
+    // typePortId : [inst : priority : time]
+    std::vector<std::tuple<DynInstPtr, int, int>> wrRfPortOccupancy;
+
+    struct NullStruct {};
+
+    // regcache only for integer
+    boost::compute::detail::lru_cache<int, NullStruct> regCache =
+        boost::compute::detail::lru_cache<int, NullStruct>(28);
+
+    // used for searching dependency chain
+    std::stack<DynInstPtr> dfs;
+
+    std::vector<int> dispSeqVec;
+
+    // should call at issue first/last cycle,
+    void specWakeUpDependents(const DynInstPtr& inst, IssueQue* from_issue_queue);
+    bool ready(OpClass op, int disp_seq);
+
+  public:
+    PendingWakeEventsType specWakeEvents;
+
+    Scheduler(const SchedulerParams& params);
+    void setCPU(CPU* cpu, LSQ* lsq);
+    void resetDepGraph(uint64_t numPhysRegs);
+    void setAllScoreBoard(PhysRegIdPtr reg);
+    void setMemDepUnit(MemDepUnit* memDepUnit) { this->memDepUnit = memDepUnit; }
+    void setMainRdpOpt(bool enable);
+
+    void tick();
+    void issueAndSelect();
+    void lookahead(std::deque<DynInstPtr>& insts);
+    bool ready(const DynInstPtr& inst, int disp_seq);
+    DynInstPtr getInstByDstReg(RegIndex flatIdx);
+
+    void addProducer(const DynInstPtr& inst);
+    // return true if insert successful
+    void insert(const DynInstPtr& inst, int disp_seq);
+    void insertNonSpec(const DynInstPtr& inst);
+    void addToFU(const DynInstPtr& inst);
+    DynInstPtr getInstToFU();
+
+    void useRfRdPort(const DynInstPtr& inst, const PhysRegIdPtr& regid, int typePortId, int pri);
+    void useRfWrPort(const DynInstPtr& inst, const PhysRegIdPtr& regid, int typePortId, int pri);
+
+    void specWakeUpFromVP(const DynInstPtr& inst);
+    void specWakeUpFromLoadPipe(const DynInstPtr& inst);
+    bool loadCancel(const DynInstPtr& inst);
+
+    void writebackWakeup(const DynInstPtr& inst);
+    void bypassWriteback(const DynInstPtr& inst);
+
+    uint32_t getOpLatency(const DynInstPtr& inst);
+    uint32_t getCorrectedOpLat(const DynInstPtr& inst);
+    bool hasReadyInsts();
+    bool isDrained();
+    void doCommit(const InstSeqNum seqNum);
+    void doSquash(const InstSeqNum seqNum);
+    uint32_t getIQInsts();
+
+    SchedulerStats& getStats() { return stats; }
+};
+
+
+}  // namespace o3
+}  // namespace gem5
+
+#endif  //__CPU_O3_INST_QUEUE_HH__
