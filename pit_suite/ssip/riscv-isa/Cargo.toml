@@ -1,0 +1,13 @@
+# Copyright James Wainwright
+#
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "riscv-isa"
+version = "0.3.1"
+edition = "2021"
+license = "MPL-2.0"
+description = "RISC-V instruction set architecture library"
+keywords = ["riscv"]
+repository = "https://codeberg.org/jwnrt/riscv-isa"
+authors = ["James Wainwright"]

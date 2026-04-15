@@ -1,0 +1,876 @@
+diff --git a/configs/common/FUScheduler.py b/configs/common/FUScheduler.py
+index 40beb184dc..4823d49933 100644
+--- a/configs/common/FUScheduler.py
++++ b/configs/common/FUScheduler.py
+@@ -189,13 +189,13 @@ class KMHV3Scheduler(Scheduler):
+         IssueQue(name='intIQ0', inports=2, size=16, oports=[
+             IssuePort(fu=[IntALU()],
+                       rp=[IntRD(0, 0), IntRD(1, 0), IntWR(0, 0)]),
+-            IssuePort(fu=[IntBJU()],
++            IssuePort(fu=[IntABU()],
+                       rp=[IntRD(1, 1), IntRD(7, 2), IntWR(0, 1)])
+         ]),
+         IssueQue(name='intIQ1', inports=2, size=16, oports=[
+             IssuePort(fu=[IntALU()],
+                       rp=[IntRD(2, 0), IntRD(3, 0), IntWR(1, 0)]),
+-            IssuePort(fu=[IntBRU()],
++            IssuePort(fu=[IntABU()],
+                       rp=[IntRD(3, 1), IntRD(9, 2), IntWR(1, 1)])
+         ]),
+         IssueQue(name='intIQ2', inports=2, size=16, oports=[
+@@ -296,7 +296,7 @@ class IdealScheduler(Scheduler):
+     __intIQs = [
+         IssueQue(name='intIQ0', inports=2, size=2*24, oports=[
+             IssuePort(fu=[IntALU(), IntMult()]),
+-            IssuePort(fu=[IntBJU()])
++            IssuePort(fu=[IntABU()])
+         ]),
+         IssueQue(name='intIQ1', inports=2, size=2*24, oports=[
+             IssuePort(fu=[IntALU(), IntMult()]),
+diff --git a/configs/example/idealkmhv3.py b/configs/example/idealkmhv3.py
+index aebedb4f85..d5683a58b1 100644
+--- a/configs/example/idealkmhv3.py
++++ b/configs/example/idealkmhv3.py
+@@ -32,6 +32,7 @@ def setKmhV3IdealParams(args, system):
+         # decode
+         cpu.decodeWidth = 8
+         cpu.enable_loadFusion = False
++        cpu.enable_abrFusion = True
+         cpu.enableConstantFolding = False
+ 
+         # rename
+diff --git a/src/arch/riscv/insts/fusion.cc b/src/arch/riscv/insts/fusion.cc
+index 9f031a40ea..061bda3037 100644
+--- a/src/arch/riscv/insts/fusion.cc
++++ b/src/arch/riscv/insts/fusion.cc
+@@ -1,4 +1,5 @@
+ #include "fusion.hh"
++#include "params/BaseO3CPU.hh"
+ 
+ namespace gem5::RiscvISAInst
+ {
+@@ -21,6 +22,21 @@ namespace RiscvISA
+ 
+ Addr FusionInst::getSecondPC() const { return second->getPC(); }
+ 
++Addr FusionInst::getSecondFallThruPC() const
++{
++    return (second->pcState()).getFallThruPC();
++}
++
++bool FusionInst::getSecondBranching() const
++{
++  return (second->pcState()).branching();
++}
++
++o3::DynInstPtr FusionInst::getSecondInst() const
++{
++  return second;
++}
++
+ class ChainFusionInst : public FusionInst
+ {
+     // only have one dst
+@@ -52,40 +68,98 @@ class ChainFusionInst : public FusionInst
+ 
+     Fault execute(ExecContext *xc, Trace::InstRecord *traceData) const override
+     {
+-        assert(fused);
++      assert(fused);
+ 
+-        PhysRegIdPtr fuseTmp = nullptr;
+-        for (int i = 0; i < fused->numSrcRegs(); ++i) {
+-            if (fused->srcRegIdx(i) == FuseTmpReg) {
+-                fuseTmp = fused->renamedSrcIdx(i);
+-                break;
+-            }
++      PhysRegIdPtr fuseTmp = nullptr;
++      for (int i = 0; i < fused->numSrcRegs(); ++i) {
++        if (fused->srcRegIdx(i) == FuseTmpReg) {
++          fuseTmp = fused->renamedSrcIdx(i);
++          break;
+         }
+-        if (fuseTmp) {
+-            first->renameDestReg(0, o3::VirtRegId(fuseTmp), o3::VirtRegId());
++      }
++      if (fuseTmp) {
++        first->renameDestReg(0, o3::VirtRegId(fuseTmp), o3::VirtRegId());
++      } else {
++        first->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
++      }
++
++      second->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
++
++      // rename
++      for (int i = 0; i < numSrcRegs(); i++) {
++        if (i < firstNumSrcs) {
++          // first inst's src
++          first->renameSrcReg(i, fused->extRenamedSrcIdx(i));
+         } else {
+-            first->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
++          // second inst's src
++          second->renameSrcReg(i - firstNumSrcs, fused->extRenamedSrcIdx(i));
+         }
++      }
+ 
+-        second->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
++      // execute
++      Fault fault = first->execute();
++      if (fault != NoFault)
++        return fault;
++      fault = second->execute();
+ 
+-        // rename
+-        for (int i = 0; i < numSrcRegs(); i++) {
+-            if (i < firstNumSrcs) {
+-                // first inst's src
+-                first->renameSrcReg(i, fused->extRenamedSrcIdx(i));
+-            } else {
+-                // second inst's src
+-                second->renameSrcReg(i - firstNumSrcs, fused->extRenamedSrcIdx(i));
++      return fault;
++    }
++};
++
++class AluBrFusionInst : public FusionInst
++{
++    // only have one dst
++    int firstNumSrcs = 0;
++  public:
++    AluBrFusionInst(const char *name, o3::DynInstPtr first, o3::DynInstPtr second)
++    : FusionInst(name, OpClass::IntABr, first, second)
++    {
++        panic_if(first->destRegIdx(0) != second->srcRegIdx(0) && first->destRegIdx(0) != second->srcRegIdx(1),
++                 "AluBR: first inst must pipe a result into second inst");
++
++        // 1. Set Destination (The ALU's output)
++        setDestRegIdx(_numDestRegs++, first->destRegIdx(0)); _numTypedDestRegs[first->destRegIdx(0).classValue()]++;
++        for (int i = 0; i < first->numSrcRegs(); ++i) {
++            setSrcRegIdx(_numSrcRegs++, first->srcRegIdx(i));
++        }
++        firstNumSrcs = first->numSrcRegs();
++
++        for (int i = 0; i < second->numSrcRegs(); ++i) {
++            if (second->srcRegIdx(i) != first->destRegIdx(0)) {
++                setSrcRegIdx(_numSrcRegs++, second->srcRegIdx(i));
+             }
+         }
+ 
+-        // execute
++        flags = first->staticInst->getFlags() | second->staticInst->getFlags();
++    }
++
++    Fault execute(ExecContext *xc, Trace::InstRecord *traceData) const override
++    {
++        assert(fused);
++
++        first->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
++        first->renameSrcReg(0, fused->extRenamedSrcIdx(0));
++
++        if (second->srcRegIdx(0) == first->destRegIdx(0)) {
++          second->renameSrcReg(0, fused->extRenamedDestIdx(0));
++          second->renameSrcReg(1, fused->extRenamedSrcIdx(1));
++        } else {
++          second->renameSrcReg(1, fused->extRenamedDestIdx(0));
++          second->renameSrcReg(0, fused->extRenamedSrcIdx(1));
++        }
++
+         Fault fault = first->execute();
+-        if (fault != NoFault)
+-            return fault;
+-        fault = second->execute();
+-        return fault;
++        if (fault != NoFault) { return fault; }
++
++        auto second_fault =  second->execute();
++
++        RiscvISA::PCState thispc;
++        thispc.set(first->getPC());
++        thispc.setNPC(second->getNPC());
++
++        xc->pcState(thispc);
++
++       return second_fault;
+     }
+ };
+ 
+@@ -236,6 +310,16 @@ chainFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
+     return new ChainFusionInst(name, vec[1]->opClass(), vec[0], vec[1]);
+ }
+ 
++StaticInstPtr
++alubrFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
++               std::function<bool(const std::vector<o3::DynInstPtr> &)> checker)
++{
++    if (!checker(vec)) {
++        return nullptr;  // cannot fuse
++    }
++    return new AluBrFusionInst(name, vec[0], vec[1]);
++}
++
+ template<int memsize>
+ StaticInstPtr
+ aluLoadFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
+@@ -288,121 +372,222 @@ const std::unordered_map<std::type_index, std::type_index> deCompressMap = {
+ #define ImmKey(t, i) FusionKey(typeid(RiscvISAInst::t), i)
+ #define AnyImmKey(t) FusionKey(typeid(RiscvISAInst::t))
+ #define ChainCreator(n, ...) [](const std::vector<o3::DynInstPtr>& vec) { return chainFuseInsts(n, std::move(vec), [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
+-#define AluLdCreator(n, s, ...) [](const std::vector<o3::DynInstPtr>& vec) { return aluLoadFuseInsts<s>(n, std::move(vec), [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
+-#define SeqLdCreator(n, s, ...) [](const std::vector<o3::DynInstPtr>& vec) { return seqLoadFuseInsts<s>(n, std::move(vec), [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
++#define AluBrCreator(n, ...) \
++[](const std::vector<o3::DynInstPtr>& vec) { return alubrFuseInsts(n, std::move(vec), \
++[](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
++#define AluLdCreator(n, s, ...) \
++[](const std::vector<o3::DynInstPtr>& vec) { return aluLoadFuseInsts<s>(n, std::move(vec), \
++[](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
++#define SeqLdCreator(n, s, ...) \
++[](const std::vector<o3::DynInstPtr>& vec) { return seqLoadFuseInsts<s>(n, std::move(vec), \
++[](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
+ 
+ #define FirstDest0EqualSecond(a, b) (a->destRegIdx(0) == b->destRegIdx(0))
+ #define Dest0EqualSrc0(x) (x->destRegIdx(0) == x->srcRegIdx(0))
+ #define Dest0EqualSrc0or1(x) ((x->destRegIdx(0) == x->srcRegIdx(0)) || (x->destRegIdx(0) == x->srcRegIdx(1)))
++#define Dest0EqualSecondSrc0or1(x, y) ((x->destRegIdx(0) == y->srcRegIdx(0)) || (x->destRegIdx(0) == y->srcRegIdx(1)))
+ #define ImmIs(a, i) (a->staticInst->getImm() == (i))
+ #define SeqLoadCheck() ((vec[0]->srcRegIdx(0) == vec[1]->srcRegIdx(0)) && (vec[0]->destRegIdx(0) != vec[0]->srcRegIdx(0)))
+ 
+ // make sure do not have the same key on different fusion tags
+ const FusionTag fusionMap = {
+     // shift + alu
+-    {ImmKey(Slli, 32), new FusionTag{
+-        {ImmKey(Srli, 32), ChainCreator("low32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {ImmKey(Srli, 31), ChainCreator("sll1zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {ImmKey(Srli, 30), ChainCreator("sll2zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {ImmKey(Srli, 29), ChainCreator("sll3zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {ImmKey(Slli, 48), new FusionTag{
+-        {ImmKey(Srli, 48), ChainCreator("low16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {ImmKey(Slliw, 16), new FusionTag{
+-        {ImmKey(Srliw, 16), ChainCreator("low16w", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {ImmKey(Sraiw, 16), ChainCreator("sext16w", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {ImmKey(Slli, 1), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("sll1add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Slli, 2), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("sll2add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Slli, 3), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("sll3add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Slli, 4), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("sll4add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Srli, 29), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("srl29add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Srli, 30), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("srl30add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Srli, 31), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("srl31add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Srli, 32), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("srl32add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-    }},
+-    {ImmKey(Srli, 8), new FusionTag{
+-        {ImmKey(Andi, 0xff), ChainCreator("byte2", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
++    {ImmKey(Slli, 32),
++     new FusionTag{
++         {ImmKey(Srli, 32), ChainCreator("low32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {ImmKey(Srli, 31), ChainCreator("sll1zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {ImmKey(Srli, 30), ChainCreator("sll2zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {ImmKey(Srli, 29), ChainCreator("sll3zext", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {ImmKey(Slli, 48),
++     new FusionTag{
++         {ImmKey(Srli, 48), ChainCreator("low16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {ImmKey(Slliw, 16),
++     new FusionTag{
++         {ImmKey(Srliw, 16), ChainCreator("low16w", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {ImmKey(Sraiw, 16), ChainCreator("sext16w", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {ImmKey(Slli, 1),
++     new FusionTag{
++         {AnyImmKey(Add), ChainCreator("sll1add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Slli, 2),
++     new FusionTag{
++         {AnyImmKey(Add), ChainCreator("sll2add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Slli, 3),
++     new FusionTag{
++         {AnyImmKey(Add), ChainCreator("sll3add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Slli, 4),
++     new FusionTag{
++         {AnyImmKey(Add), ChainCreator("sll4add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Srli, 29),
++     new FusionTag{
++         {AnyImmKey(Add),
++          ChainCreator("srl29add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Srli, 30),
++     new FusionTag{
++         {AnyImmKey(Add),
++          ChainCreator("srl30add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Srli, 31),
++     new FusionTag{
++         {AnyImmKey(Add),
++          ChainCreator("srl31add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Srli, 32),
++     new FusionTag{
++         {AnyImmKey(Add),
++          ChainCreator("srl32add", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]))},
++     }},
++    {ImmKey(Srli, 8),
++     new FusionTag{
++         {ImmKey(Andi, 0xff), ChainCreator("byte2", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++
+     // add
+-    {AnyImmKey(Add), new FusionTag{
+-        {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Addw), new FusionTag{
+-        {ImmKey(Andi, 255), ChainCreator("addwbyte", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {ImmKey(Andi, 1), ChainCreator("addwbit", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("addwzexth", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Sext_h), ChainCreator("addwsexth", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Addi), new FusionTag{
+-        {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Lui), new FusionTag{
+-        {AnyImmKey(Addi), ChainCreator("lui32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Addiw), ChainCreator("luiw32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Auipc), new FusionTag{
+-        {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
++    {AnyImmKey(Add),
++     new FusionTag{
++         {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Addw),
++     new FusionTag{
++         {ImmKey(Andi, 255),
++          ChainCreator("addwbyte", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {ImmKey(Andi, 1), ChainCreator("addwbit", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h),
++          ChainCreator("addwzexth", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Sext_h),
++          ChainCreator("addwsexth", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Addi),
++     new FusionTag{
++         {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++
++         {AnyImmKey(Beq), AluBrCreator("addibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bne), AluBrCreator("addibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Blt), AluBrCreator("addiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bge), AluBrCreator("addibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bltu), AluBrCreator("addibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bgeu), AluBrCreator("addibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++     }},
++    {AnyImmKey(Lui),
++     new FusionTag{
++         {AnyImmKey(Addi), ChainCreator("lui32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Addiw), ChainCreator("luiw32", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Auipc),
++     new FusionTag{
++         {AnyImmKey(Ld), AluLdCreator("farld", 8, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++
+     // logic
+-    {AnyImmKey(Andi), new FusionTag{
+-        {AnyImmKey(Add), ChainCreator("oddadd", ImmIs(vec[0], 1) && FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-        {AnyImmKey(Addw), ChainCreator("oddaddw", ImmIs(vec[0], 1) && FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-        {AnyImmKey(Or), ChainCreator("orh48", ImmIs(vec[0], -256) && FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-        {AnyImmKey(Mulw), ChainCreator("mulw7", ImmIs(vec[0], 127) && FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0or1(vec[1]) )},
+-
+-        {ImmKey(Andi, 1), ChainCreator("andi1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("andi16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(And), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("and1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("and16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Ori), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("ori1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("ori16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Or), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("or1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("or16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Xori), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("xori1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("xori16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Xor), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("xor1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("xor16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
+-    {AnyImmKey(Orc_b), new FusionTag{
+-        {ImmKey(Andi, 1), ChainCreator("orcb1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-        {AnyImmKey(Zext_h), ChainCreator("orcb16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]) )},
+-    }},
++    {AnyImmKey(Andi),
++     new FusionTag{
++         {AnyImmKey(Add), ChainCreator("oddadd", ImmIs(vec[0], 1) && FirstDest0EqualSecond(vec[0], vec[1]) &&
++                                                     Dest0EqualSrc0or1(vec[1]))},
++         {AnyImmKey(Addw), ChainCreator("oddaddw", ImmIs(vec[0], 1) && FirstDest0EqualSecond(vec[0], vec[1]) &&
++                                                       Dest0EqualSrc0or1(vec[1]))},
++         {AnyImmKey(Or), ChainCreator("orh48", ImmIs(vec[0], -256) && FirstDest0EqualSecond(vec[0], vec[1]) &&
++                                                   Dest0EqualSrc0or1(vec[1]))},
++         {AnyImmKey(Mulw), ChainCreator("mulw7", ImmIs(vec[0], 127) && FirstDest0EqualSecond(vec[0], vec[1]) &&
++                                                     Dest0EqualSrc0or1(vec[1]))},
++
++         {ImmKey(Andi, 1), ChainCreator("andi1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("andi16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++
++         {AnyImmKey(Beq), AluBrCreator("andibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bne), AluBrCreator("andibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Blt), AluBrCreator("andiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bge), AluBrCreator("andibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bltu), AluBrCreator("andibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++         {AnyImmKey(Bgeu), AluBrCreator("andibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++     }},
++    {AnyImmKey(And),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("and1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("and16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Ori),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("ori1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("ori16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Or),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("or1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("or16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Xori),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("xori1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("xori16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Xor),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("xor1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("xor16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++    {AnyImmKey(Orc_b),
++     new FusionTag{
++         {ImmKey(Andi, 1), ChainCreator("orcb1", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++         {AnyImmKey(Zext_h), ChainCreator("orcb16", FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
++     }},
++
++    // alu-br creator
++    // {AnyImmKey(Addi),
++    //  new FusionTag{
++    //    {AnyImmKey(Beq), AluBrCreator("addibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bne), AluBrCreator("addibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Blt), AluBrCreator("addiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bge), AluBrCreator("addibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bltu), AluBrCreator("addibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bgeu), AluBrCreator("addibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //  }},
++
++    // {AnyImmKey(Andi),
++    //  new FusionTag{
++    //    {AnyImmKey(Beq), AluBrCreator("andibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bne), AluBrCreator("andibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Blt), AluBrCreator("andiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bge), AluBrCreator("andibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bltu), AluBrCreator("andibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //    {AnyImmKey(Bgeu), AluBrCreator("andibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++    //  }},
++
++    {AnyImmKey(Srai),
++     new FusionTag{
++       {AnyImmKey(Beq), AluBrCreator("sraibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bne), AluBrCreator("sraibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Blt), AluBrCreator("sraiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bge), AluBrCreator("sraibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bltu), AluBrCreator("sraibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bgeu), AluBrCreator("sraibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++     }},
++
++    {AnyImmKey(Slti),
++     new FusionTag{
++       {AnyImmKey(Beq), AluBrCreator("sltibeq", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bne), AluBrCreator("sltibne", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Blt), AluBrCreator("sltiblt", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bge), AluBrCreator("sltibge", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bltu), AluBrCreator("sltibltu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++       {AnyImmKey(Bgeu), AluBrCreator("sltibgeu", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
++     }},
++
+     // load
+     {AnyImmKey(Ld), new FusionTag{
+         {AnyImmKey(Ld), SeqLdCreator("ldld", 16, SeqLoadCheck() && ImmIs(vec[1], vec[0]->staticInst->getImm() + 8) )},
+diff --git a/src/arch/riscv/insts/fusion.hh b/src/arch/riscv/insts/fusion.hh
+index e74219c415..df00fc861e 100644
+--- a/src/arch/riscv/insts/fusion.hh
++++ b/src/arch/riscv/insts/fusion.hh
+@@ -43,6 +43,9 @@ class FusionInst : public RiscvStaticInst
+     virtual bool correctMisalign(Addr addr) const { return false; }
+ 
+     Addr getSecondPC() const;
++    Addr getSecondFallThruPC() const;
++    bool getSecondBranching() const;
++    o3::DynInstPtr getSecondInst() const;
+ 
+     std::string generateDisassembly(Addr pc, const loader::SymbolTable *symtab) const override {
+         std::string str = std::string(mnemonic);
+diff --git a/src/cpu/FuncUnit.py b/src/cpu/FuncUnit.py
+index d8800c86a2..da6d907ab3 100644
+--- a/src/cpu/FuncUnit.py
++++ b/src/cpu/FuncUnit.py
+@@ -74,7 +74,10 @@ class OpClass(Enum):
+ 
+             'VectorIntegerArith', 'VectorFloatArith', 'VectorFloatConvert',
+             'VectorIntegerReduce', 'VectorFloatReduce',
+-            'VectorMisc', 'VectorIntegerExtension', 'VectorConfig'
++            'VectorMisc', 'VectorIntegerExtension', 'VectorConfig',
++
++            # ABR Fusion
++            'IntABr'
+             ]
+ 
+ class OpDesc(SimObject):
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index f1800c4e21..782bb9eb0c 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -255,6 +255,7 @@ class BaseO3CPU(BaseCPU):
+     store_prefetch_train = Param.Bool(True, "Training store prefetcher with store addresses")
+ 
+     enable_loadFusion = Param.Bool(False, "Enable load fusion")
++    enable_abrFusion = Param.Bool(False, "Enable Alu-Branch fusion")
+ 
+     enableConstantFolding = Param.Bool(False, "Enable Constant Folding (add-immediate elimination)")
+     enableMovImmElimination = Param.Bool(False, "Enable MOVI elimination")
+diff --git a/src/cpu/o3/FuncUnitConfig.py b/src/cpu/o3/FuncUnitConfig.py
+index 73c086617c..8bfa8bb81b 100644
+--- a/src/cpu/o3/FuncUnitConfig.py
++++ b/src/cpu/o3/FuncUnitConfig.py
+@@ -63,6 +63,11 @@ class IntBJU(FUDesc):
+     opList = [ OpDesc(opClass='IntBr'),
+                OpDesc(opClass='IntJp') ]
+ 
++class IntABU(FUDesc):
++    opList = [ OpDesc(opClass='IntBr'),
++               OpDesc(opClass='IntJp'),
++               OpDesc(opClass='IntABr')]
++
+ class IntMultDiv(FUDesc):
+     opList = [ OpDesc(opClass='IntMult', opLat=3),
+                OpDesc(opClass='IntDiv', opLat=20, pipelined=False) ]
+diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+index ff94d4fdb7..5678952e78 100644
+--- a/src/cpu/o3/commit.cc
++++ b/src/cpu/o3/commit.cc
+@@ -48,6 +48,7 @@
+ 
+ #include "arch/riscv/decoder.hh"
+ #include "arch/riscv/faults.hh"
++#include "arch/riscv/insts/fusion.hh"
+ #include "arch/riscv/insts/static_inst.hh"
+ #include "arch/riscv/pcstate.hh"
+ #include "arch/riscv/regs/misc.hh"
+@@ -1264,11 +1265,14 @@ Commit::commitInsts()
+ 
+                     // FIXME: ignore mret/sret/uret in correspond with RTL
+                     if (!head_inst->isNonSpeculative() && head_inst->isControl()) {
+-                        dbbtb->commitBranch(head_inst, miss);
+-                        if (!head_inst->isReturn() && head_inst->isIndirectCtrl() && miss) {
+-                            misPredIndirect[head_inst->pcState().instAddr()]++;
+-                        }
++                      // fusion case handled IN the function
++                      dbbtb->commitBranch(head_inst, miss);
++
++                      if (!head_inst->isReturn() && head_inst->isIndirectCtrl() && miss) {
++                        misPredIndirect[head_inst->pcState().instAddr()]++;
++                      }
+                     }
++
+                     dbbtb->notifyInstCommit(head_inst);
+                 }
+                     if (traceMaybeExitOnLastTraceInst(head_inst)) {
+@@ -1507,7 +1511,7 @@ Commit::commitInsts()
+ void
+ Commit::diffInst(ThreadID tid, const DynInstPtr &inst) {
+     cpu->diffInfo.lastCommittedMsg.push(inst);
+-    if (cpu->diffInfo.lastCommittedMsg.size() > 20) {
++    if (cpu->diffInfo.lastCommittedMsg.size() > 40) {
+         cpu->diffInfo.lastCommittedMsg.pop();
+     }
+     cpu->diffInfo.inst = inst->staticInst;
+diff --git a/src/cpu/o3/decode.cc b/src/cpu/o3/decode.cc
+index e78eb0799e..60479b2920 100644
+--- a/src/cpu/o3/decode.cc
++++ b/src/cpu/o3/decode.cc
+@@ -75,6 +75,7 @@ Decode::Decode(CPU *_cpu, const BaseO3CPUParams &params)
+       decodeWidth(params.decodeWidth),
+       numThreads(params.numThreads),
+       enableLoadFusion(params.enable_loadFusion),
++      enableAbrFusion(params.enable_abrFusion),
+       stats(_cpu)
+ {
+     if (decodeWidth > MaxWidth)
+@@ -314,23 +315,30 @@ Decode::squash(const DynInstPtr &inst, ThreadID tid)
+     DPRINTF(Decode, "[tid:%i] [sn:%llu] Squashing due to incorrect branch "
+             "prediction detected at decode.\n", tid, inst->seqNum);
+ 
++    DynInstPtr ctrl_inst;
++    if (inst->isFusion()) {
++        ctrl_inst = dynamic_cast<RiscvISA::FusionInst *>(inst->staticInst.get())->getSecondInst();
++    } else {
++        ctrl_inst = inst;
++    }
++
+     // Send back mispredict information.
+     toFetch->decodeInfo[tid].branchMispredict = true;
+     toFetch->decodeInfo[tid].predIncorrect = true;
+-    toFetch->decodeInfo[tid].mispredictInst = inst;
++    toFetch->decodeInfo[tid].mispredictInst = ctrl_inst;
+     toFetch->decodeInfo[tid].squash = true;
+     toFetch->decodeInfo[tid].doneSeqNum = inst->seqNum;
+-    if (inst->isControl()) {
+-        if (!inst->isReturn()) {
+-            set(toFetch->decodeInfo[tid].nextPC, *inst->branchTarget());
++    if (ctrl_inst->isControl()) {
++        if (!ctrl_inst->isReturn()) {
++            set(toFetch->decodeInfo[tid].nextPC, *ctrl_inst->branchTarget());
+         } else {
+             // if it is return, the target must have already been set in pred target now
+-            std::unique_ptr<PCStateBase> tgt_ptr(inst->readPredTarg().clone());
++            std::unique_ptr<PCStateBase> tgt_ptr(ctrl_inst->readPredTarg().clone());
+             set(toFetch->decodeInfo[tid].nextPC, *tgt_ptr);
+         }
+     } else {
+-        std::unique_ptr<PCStateBase> npc_ptr(inst->pcState().clone());
+-        npc_ptr->as<RiscvISA::PCState>().set(inst->pcState().getFallThruPC());
++        std::unique_ptr<PCStateBase> npc_ptr(ctrl_inst->pcState().clone());
++        npc_ptr->as<RiscvISA::PCState>().set(ctrl_inst->pcState().getFallThruPC());
+         set(toFetch->decodeInfo[tid].nextPC, *npc_ptr);
+     }
+ 
+@@ -950,6 +958,9 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
+     if (!enableLoadFusion && (vec.back()->isLoad() || cur->isLoad())) {
+         return;
+     }
++    if (!enableAbrFusion && vec.back()->isControl()) {
++        return;
++    }
+     if (vec.back()->getPC() >= ignoreFusionPC && vec.back()->getPC() < ignoreFusionPC + 8) {
+         // ignore fusion for this pc range
+         if (cpu->ticksToCycles(curTick() - lastSetIgnoreTick) > keepIgnoreFusionCycles) {
+@@ -1001,8 +1012,8 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
+     RiscvISA::PCState thispc, predPC;
+     thispc.set(inst_pair[0]->getPC());
+     thispc.setNPC(inst_pair[1]->getNPC());
+-    predPC.update(thispc);
+-    predPC.advance();
++
++    predPC.update(*(inst_pair[1]->predPC));
+ 
+     // Create a new DynInst from the instruction fetched.
+     DynInstPtr instruction = new (arrays) DynInst(
+@@ -1013,6 +1024,8 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
+     instruction->setTid(inst_pair[1]->threadNumber);
+     instruction->thread = inst_pair[1]->thread;
+     instruction->setFtqId(inst_pair[1]->ftqId);
++    instruction->setLoopIteration(inst_pair[1]->loopIteration);
++    instruction->fallThruPC = inst_pair[1]->fallThruPC;
+ 
+     instruction->instListIt = cpu->instList.insert(inst_pair[0]->instListIt, instruction);
+     cpu->instList.erase(inst_pair[0]->instListIt);
+diff --git a/src/cpu/o3/decode.hh b/src/cpu/o3/decode.hh
+index 4564195e3e..b5ea1e3a0f 100644
+--- a/src/cpu/o3/decode.hh
++++ b/src/cpu/o3/decode.hh
+@@ -314,6 +314,7 @@ class Decode
+     bool squashAfterDelaySlot[MaxThreads];
+ 
+     bool enableLoadFusion;
++    bool enableAbrFusion;
+ 
+     struct DecodeStats : public statistics::Group
+     {
+diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
+index 83c55e60b5..7907bb980e 100644
+--- a/src/cpu/o3/iew.cc
++++ b/src/cpu/o3/iew.cc
+@@ -47,6 +47,7 @@
+ 
+ #include <queue>
+ 
++#include "arch/riscv/insts/fusion.hh"
+ #include "arch/riscv/pcstate.hh"
+ #include "base/output.hh"
+ #include "base/stats/info.hh"
+@@ -566,16 +567,25 @@ IEW::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
+     if (!toCommit->squash[tid] ||
+             inst->seqNum < toCommit->squashedSeqNum[tid]) {
+         toCommit->squash[tid] = true;
+-        toCommit->squashedSeqNum[tid] = inst->seqNum;
+-        toCommit->squashedTargetId[tid] = inst->getFtqId();
+-        toCommit->squashedLoopIter[tid] = inst->getLoopIteration();
+-        toCommit->branchTaken[tid] = inst->pcState().branching();
+ 
+-        set(toCommit->pc[tid], inst->pcState());
+-        inst->staticInst->advancePC(*toCommit->pc[tid]);
++        DynInstPtr ctrl_inst;
++        if (inst->isFusion()) {
++          ctrl_inst = dynamic_cast<RiscvISA::FusionInst *>
++                        (inst->staticInst.get())->getSecondInst();
++
++        } else {
++          ctrl_inst = inst;
++        }
+ 
+-        toCommit->mispredictInst[tid] = inst;
++        set(toCommit->pc[tid], ctrl_inst->pcState());
++        ctrl_inst->staticInst->advancePC(*toCommit->pc[tid]);
++        toCommit->squashedTargetId[tid] = ctrl_inst->getFtqId();
++        toCommit->squashedLoopIter[tid] = ctrl_inst->getLoopIteration();
++
++        toCommit->mispredictInst[tid] = ctrl_inst;
++        toCommit->squashedSeqNum[tid] = inst->seqNum;
+         toCommit->includeSquashInst[tid] = false;
++        toCommit->branchTaken[tid] = ctrl_inst->pcState().branching();
+ 
+         wroteToTimeBuffer = true;
+ 
+@@ -1566,8 +1576,15 @@ IEW::SquashCheckAfterExe(DynInstPtr inst)
+     if (inst->isControl()) {
+         auto &resolved_cfis = toFetch->iewInfo[tid].resolvedCFIs;
+         TimeStruct::IewComm::ResolvedCFIEntry entry;
++
+         entry.ftqId = inst->getFtqId();
+-        entry.pc = inst->getPC();
++        if (inst->isFusion()) {
++          entry.pc = dynamic_cast<RiscvISA::FusionInst *>
++            (inst->staticInst.get())->getSecondPC();
++        } else {
++          entry.pc = inst->getPC();
++        }
++
+         resolved_cfis.push_back(entry);
+     }
+ 
+diff --git a/src/cpu/pred/btb/decoupled_bpred_stats.cc b/src/cpu/pred/btb/decoupled_bpred_stats.cc
+index cd6b625322..43b2bf3c9c 100644
+--- a/src/cpu/pred/btb/decoupled_bpred_stats.cc
++++ b/src/cpu/pred/btb/decoupled_bpred_stats.cc
+@@ -2,6 +2,7 @@
+ #include <sstream>
+ #include <tuple>
+ 
++#include "arch/riscv/insts/fusion.hh"
+ #include "base/output.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/pred/btb/decoupled_bpred.hh"
+@@ -795,9 +796,6 @@ DecoupledBPUWithBTB::commitBranch(const DynInstPtr &inst, bool mispred)
+         addCfi(OTHER, mispred);
+     }
+ 
+-    auto branchClass = classifyBranch(inst);
+-    addBranchClassStat(branchClass, mispred);
+-
+     // ---------- Find corresponding fetch target entry ----------
+     auto entry = getTarget(inst->ftqId);
+ 
+@@ -807,12 +805,33 @@ DecoupledBPUWithBTB::commitBranch(const DynInstPtr &inst, bool mispred)
+     }
+ 
+     // ---------- Extract branch information ----------
+-    Addr branchAddr = inst->pcState().instAddr();
+-    const auto &rv_pc = inst->pcState().as<RiscvISA::PCState>();
+-    Addr targetAddr = rv_pc.npc();
+-    Addr fallThruPC = rv_pc.getFallThruPC();
+-    BranchInfo info(branchAddr, targetAddr, inst->staticInst, fallThruPC-branchAddr);
+-    bool taken = rv_pc.branching() || inst->isUncondCtrl();
++    Addr branchAddr, targetAddr, fallThruPC;
++    bool taken;
++    DynInstPtr updinst;
++
++    if (inst->isFusion()) {
++      auto fusedInst = dynamic_cast<RiscvISA::FusionInst*>(inst->staticInst.get());
++      branchAddr = fusedInst->getSecondPC();
++      const auto &rv_pc = inst->pcState().as<RiscvISA::PCState>();
++      targetAddr = rv_pc.npc();
++      fallThruPC = fusedInst->getSecondFallThruPC();
++      taken = fusedInst->getSecondBranching() || inst->isUncondCtrl();
++
++      updinst = fusedInst->getSecondInst();
++    } else {
++      branchAddr = inst->pcState().instAddr();
++      const auto &rv_pc = inst->pcState().as<RiscvISA::PCState>();
++      targetAddr = rv_pc.npc();
++      fallThruPC = rv_pc.getFallThruPC();
++      taken = rv_pc.branching() || inst->isUncondCtrl();
++
++      updinst = inst;
++    }
++
++    auto branchClass = classifyBranch(updinst);
++    addBranchClassStat(branchClass, mispred);
++
++    BranchInfo info(branchAddr, targetAddr, updinst->staticInst, fallThruPC-branchAddr);
+ 
+     // ---------- Process misprediction and update statistics ----------
+     processMisprediction(entry, branchAddr, info, taken, mispred);
+@@ -824,7 +843,7 @@ DecoupledBPUWithBTB::commitBranch(const DynInstPtr &inst, bool mispred)
+ 
+     // ---------- Update predictor components ----------
+     for (auto component : components) {
+-        component->commitBranch(entry, inst);
++        component->commitBranch(entry, updinst);
+     }
+     //here add final counter
+ 
+@@ -913,10 +932,11 @@ void
+ DecoupledBPUWithBTB::notifyInstCommit(const DynInstPtr &inst)
+ {
+     // Update committed instruction count for target
+-    getTarget(inst->ftqId).commitInstNum++;
++    int count = inst->isFusion() ? 2 : 1;
++    getTarget(inst->ftqId).commitInstNum += count;
+ 
+     // Update global committed instruction count
+-    numInstCommitted++;
++    numInstCommitted += count;
+ 
+     DPRINTF(Profiling, "notifyInstCommit, inst=%s, commitInstNum=%d\n",
+             inst->staticInst->disassemble(inst->pcState().instAddr()),

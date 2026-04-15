@@ -1,0 +1,23 @@
+Total Decoded Instructions: 20000001
+Compressed Instructions: 7713978 (38.57%)
+Vector Instructions: 0 (0.00%)
+--- Instruction Mix ---
+Load Accesses: 4332831 (21.66%)
+Store Accesses: 2900813 (14.50%)
+Mem Insts: 7233644 (36.17%)
+Control Instructions: 3454211 (17.27%)
+Float Instructions: 0 (0.00%)
+--- Fusion Profiler ---
+Fused Pairs: 837855 (8.38%)
+Adjacent Load Fusions: 82586 (3.81%)
+Far Loads: 5141 (0.12%)
+Logic Fusions: 301351
+Branch Fusion (Theoretical): 448773 (12.99%)
+Branch Fusion w/ Const Idioms (Theoretical): 319198 (9.24%)
+JALR Fusion (Theoretical): 0 (0.00%)
+Multiply-Accumulate Fusions: 4 (0.00%)
+Average Distance for ALUBR: 42.70
+Triple Fusions: 485
+  SLLI+ADD+LD/ST: 485
+  SRAI+XOR+SUB: 0
+  LUI+ADDI+SLLI: 0

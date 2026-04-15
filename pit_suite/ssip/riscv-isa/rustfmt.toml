@@ -1,0 +1,8 @@
+# Copyright James Wainwright
+#
+# SPDX-License-Identifier: MPL-2.0
+
+# Makes the `Instruction` constructions readable in `crate::decode`:
+struct_lit_width = 80
+# Makes the `Instruction` definition readable in `crate::instruction`:
+struct_variant_width = 80
