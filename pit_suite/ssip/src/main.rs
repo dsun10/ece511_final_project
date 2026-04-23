@@ -355,11 +355,11 @@ fn fusion_profiler(state: &mut TracerState, pkt: Option<&PitInst>, finish: bool)
             state.adjloads += 1;
         }
 
-        // Multiply-accumulate: MUL/MULW result fed directly into ADD/ADDW
+        // Multiply-accumulate: MUL/MULW result consumed by ADD/ADDW (any destination)
         (MUL  { rd: rd1, .. } | MULW { rd: rd1, .. },
-         ADD  { rd: rd2, rs1, rs2 } |
-         ADDW { rd: rd2, rs1, rs2 })
-            if rd1 == rd2 && (rs1 == rd1 || rs2 == rd1) => {
+         ADD  { rs1, rs2, .. } |
+         ADDW { rs1, rs2, .. })
+            if rs1 == rd1 || rs2 == rd1 => {
             state.fusions += 1;
             state.macc += 1;
         },

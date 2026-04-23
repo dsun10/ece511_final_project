@@ -142,6 +142,8 @@ class Decode
   private:
 
     void checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur);
+    bool checkAndFuseTriple(std::vector<DynInstPtr> &vec, DynInstPtr& cur,
+                            boost::circular_buffer<DynInstPtr>& pending);
 
     /** Updates overall decode status based on all of the threads' statuses. */
     void updateActivate();
@@ -250,6 +252,7 @@ class Decode
 
     bool enableLoadFusion;
     bool enableAbrFusion;
+    bool enableMACFusion;
 
     struct DecodeStats : public statistics::Group
     {
@@ -271,6 +274,9 @@ class Decode
         statistics::Scalar branchMispred;
 
         statistics::Scalar numFusedInsts;
+        statistics::Scalar numAbrFusedInsts;
+        statistics::Scalar numMacFusedInsts;
+        statistics::Scalar numTripleFusedInsts;
         statistics::Vector fusedInsts;
         /** Stat for number of times decode detected a non-control instruction
          * incorrectly predicted as a branch.

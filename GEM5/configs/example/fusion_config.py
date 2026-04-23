@@ -32,9 +32,9 @@ def setKmhV3Params(args, system):
 
         # decode
         cpu.decodeWidth = 8
-        cpu.enable_loadFusion = False
-        cpu.enable_abrFusion = False
-        cpu.enable_macFusion = False
+        cpu.enable_loadFusion = True
+        cpu.enable_abrFusion = True
+        cpu.enable_macFusion = True
         cpu.enableConstantFolding = False
 
         # rename

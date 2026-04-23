@@ -101,6 +101,7 @@ public:
 
 extern const std::unordered_map<std::type_index, std::type_index> deCompressMap;
 extern const FusionTag fusionMap;
+extern const FusionTag fusionMap3;
 
 }
 

@@ -76,6 +76,7 @@ Decode::Decode(CPU *_cpu, const BaseO3CPUParams &params)
       numThreads(params.numThreads),
       enableLoadFusion(params.enable_loadFusion),
       enableAbrFusion(params.enable_abrFusion),
+      enableMACFusion(params.enable_macFusion),
       stats(_cpu)
 {
     if (decodeWidth > MaxWidth)
@@ -145,6 +146,12 @@ Decode::DecodeStats::DecodeStats(CPU *cpu)
                "Number of times decode detected a branch misprediction"),
       ADD_STAT(numFusedInsts, statistics::units::Count::get(),
                "Number of fused instructions handled by decode"),
+      ADD_STAT(numAbrFusedInsts, statistics::units::Count::get(),
+               "Number of ALU-branch fused instructions handled by decode"),
+      ADD_STAT(numMacFusedInsts, statistics::units::Count::get(),
+               "Number of multiply-accumulate fused instructions handled by decode"),
+      ADD_STAT(numTripleFusedInsts, statistics::units::Count::get(),
+               "Number of triple (SLLI+ADD+LD/ST) fused instructions handled by decode"),
       ADD_STAT(fusedInsts, statistics::units::Count::get(),
                "Number of times decode fused instructions by type"),
       ADD_STAT(controlMispred, statistics::units::Count::get(),
@@ -609,7 +616,12 @@ Decode::decodeInsts(ThreadID tid)
         // This current instruction is valid, so add it into the decode
         // queue.  The next instruction may not be valid, so check to
         // see if branches were predicted correctly.
-        checkAndFuseInsts(fusionInst, inst);
+        if (checkAndFuseTriple(fusionInst, inst, insts_to_decode)) {
+            --insts_available;
+            ++stats.decodedInsts;
+        } else {
+            checkAndFuseInsts(fusionInst, inst);
+        }
         fusionInst.push_back(inst);
 
         ++toRenameIndex;
@@ -787,6 +799,10 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
         return;
     }
 
+    if (!enableMACFusion && vec.back()->opClass() == IntMultOp) {
+        return;
+    }
+
     if (vec.back()->getPC() >= ignoreFusionPC && vec.back()->getPC() < ignoreFusionPC + 8) {
         // ignore fusion for this pc range
         if (cpu->ticksToCycles(curTick() - lastSetIgnoreTick) > keepIgnoreFusionCycles) {
@@ -862,11 +878,109 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
     cur = instruction;
     stats.numFusedInsts++;
 
+    if (fused_inst->opClass() == OpClass::IntABr) {
+        stats.numAbrFusedInsts++;
+    }
+
+    {
+        const char *mn = fused_inst->getMnemonic();
+        if (strcmp(mn, "muladd")   == 0 || strcmp(mn, "muladdw")  == 0 ||
+            strcmp(mn, "mulwadd")  == 0 || strcmp(mn, "mulwaddw") == 0) {
+            stats.numMacFusedInsts++;
+        }
+    }
+
     if (fusionType.find(fused_inst->getMnemonic()) == fusionType.end()) {
         fusionType[fused_inst->getMnemonic()] = 1;
     } else {
         fusionType[fused_inst->getMnemonic()]++;
     }
+}
+
+bool
+Decode::checkAndFuseTriple(std::vector<DynInstPtr> &vec, DynInstPtr& cur,
+                            boost::circular_buffer<DynInstPtr>& pending)
+{
+    if (vec.empty() || pending.empty()) return false;
+    if (!enableLoadFusion) return false;
+    if (vec.back()->faulted() || cur->faulted() || pending.front()->faulted()) return false;
+
+    // Level 1: look up vec.back() (SLLI) in fusionMap3
+    auto *first_si = vec.back()->staticInst.get();
+    std::type_index first_type = typeid(*first_si);
+    {
+        auto it = RiscvISA::deCompressMap.find(first_type);
+        if (it != RiscvISA::deCompressMap.end()) first_type = it->second;
+    }
+    auto f1 = RiscvISA::fusionMap3.find(RiscvISA::FusionKey(first_type, first_si->getImm()));
+    if (f1 == RiscvISA::fusionMap3.end()) return false;
+    assert(f1->second.index() == 1);
+
+    // Level 2: look up cur (ADD)
+    auto *second_si = cur->staticInst.get();
+    std::type_index second_type = typeid(*second_si);
+    {
+        auto it = RiscvISA::deCompressMap.find(second_type);
+        if (it != RiscvISA::deCompressMap.end()) second_type = it->second;
+    }
+    auto *map2 = std::get<1>(f1->second);
+    auto f2 = map2->find(RiscvISA::FusionKey(second_type, second_si->getImm()));
+    if (f2 == map2->end()) return false;
+    assert(f2->second.index() == 1);
+
+    // Level 3: look up pending.front() (LD)
+    auto *third_si = pending.front()->staticInst.get();
+    std::type_index third_type = typeid(*third_si);
+    {
+        auto it = RiscvISA::deCompressMap.find(third_type);
+        if (it != RiscvISA::deCompressMap.end()) third_type = it->second;
+    }
+    auto *map3 = std::get<1>(f2->second);
+    auto f3 = map3->find(RiscvISA::FusionKey(third_type, third_si->getImm()));
+    if (f3 == map3->end()) return false;
+    assert(f3->second.index() == 0);
+
+    DynInstPtr third = pending.front();
+    const std::vector<DynInstPtr> inst_triple = {vec.back(), cur, third};
+    auto creator = std::get<0>(f3->second);
+    auto fused_inst = creator(inst_triple);
+    if (!fused_inst) return false;
+
+    // Consume third from pending buffer and first from vec
+    pending.pop_front();
+    vec.pop_back();
+
+    DynInst::Arrays arrays;
+    arrays.numSrcs = fused_inst->numSrcRegs();
+    arrays.numDests = fused_inst->numDestRegs();
+
+    RiscvISA::PCState thispc, predPC;
+    thispc.set(inst_triple[0]->getPC());
+    thispc.setNPC(inst_triple[2]->getNPC());
+    predPC.update(*(inst_triple[2]->predPC));
+
+    DynInstPtr instruction = new (arrays) DynInst(
+            arrays, fused_inst, fused_inst, thispc, predPC, inst_triple[0]->seqNum, cpu);
+
+    instruction->setVersion(inst_triple[2]->getVersion());
+    instruction->setTid(inst_triple[2]->threadNumber);
+    instruction->thread = inst_triple[2]->thread;
+    instruction->setFtqId(inst_triple[2]->ftqId);
+    instruction->setLoopIteration(inst_triple[2]->loopIteration);
+    instruction->fallThruPC = inst_triple[2]->fallThruPC;
+
+    instruction->instListIt = cpu->instList.insert(inst_triple[0]->instListIt, instruction);
+    cpu->instList.erase(inst_triple[0]->instListIt);
+    cpu->instList.erase(inst_triple[1]->instListIt);
+    cpu->instList.erase(inst_triple[2]->instListIt);
+
+    dynamic_cast<RiscvISA::FusionInst*>(fused_inst.get())->setFusedInst(instruction);
+
+    cur = instruction;
+    stats.numFusedInsts++;
+    stats.numTripleFusedInsts++;
+    fusionType[fused_inst->getMnemonic()]++;
+    return true;
 }
 
 void

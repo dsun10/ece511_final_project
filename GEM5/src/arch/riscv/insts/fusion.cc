@@ -164,6 +164,98 @@ class AluBrFusionInst : public FusionInst
 };
 
 
+// mul rd_mul, rs1, rs2 (first) + add/addw rd_add, rx, ry (second)
+// where rd_mul == rx or ry, and rd_add may differ from rd_mul.
+// MUL result is passed to ADD via FuseTmpReg; fused dest is ADD's destination.
+//
+// Source layout: [rs1_mul, rs2_mul, FuseTmpReg, rs_accum]
+//   rs_accum is whichever ADD source is NOT the MUL result.
+class MaccFusionInst : public FusionInst
+{
+    int firstNumSrcs = 0;
+  public:
+    MaccFusionInst(const char *name, OpClass op, o3::DynInstPtr first, o3::DynInstPtr second)
+        : FusionInst(name, op, first, second)
+    {
+        panic_if(first->destRegIdx(0) != second->srcRegIdx(0) &&
+                 first->destRegIdx(0) != second->srcRegIdx(1),
+                 "MaccFusionInst: MUL result must be consumed by ADD/ADDW");
+
+        // Count how many of ADD's sources are the MUL result — must be exactly one
+        // so there is always a distinct accumulator source to track.
+        int matchCount = 0;
+        for (int i = 0; i < second->numSrcRegs(); ++i) {
+            if (second->srcRegIdx(i) == first->destRegIdx(0)) matchCount++;
+        }
+        panic_if(matchCount == second->numSrcRegs(),
+                 "MaccFusionInst: both ADD sources equal the MUL dest — use ChainFusionInst");
+
+        // Fused destination is ADD's output register
+        setDestRegIdx(_numDestRegs++, second->destRegIdx(0));
+        _numTypedDestRegs[second->destRegIdx(0).classValue()]++;
+
+        // Sources [0..firstNumSrcs-1]: MUL's register inputs (rs1, rs2)
+        for (int i = 0; i < first->numSrcRegs(); ++i) {
+            setSrcRegIdx(_numSrcRegs++, first->srcRegIdx(i));
+        }
+        firstNumSrcs = first->numSrcRegs();
+
+        // Source [firstNumSrcs]: FuseTmpReg — placeholder for the MUL result
+        setSrcRegIdx(_numSrcRegs++, FuseTmpReg);
+
+        // Source [firstNumSrcs+1]: ADD's accumulator (the source that is NOT the MUL result)
+        for (int i = 0; i < second->numSrcRegs(); ++i) {
+            if (second->srcRegIdx(i) != first->destRegIdx(0)) {
+                setSrcRegIdx(_numSrcRegs++, second->srcRegIdx(i));
+                break;
+            }
+        }
+
+        flags = first->staticInst->getFlags() | second->staticInst->getFlags();
+    }
+
+    Fault execute(ExecContext *xc, Trace::InstRecord *traceData) const override
+    {
+        assert(fused);
+
+        // Locate the physical register backing FuseTmpReg
+        PhysRegIdPtr fuseTmp = nullptr;
+        for (int i = 0; i < fused->numSrcRegs(); ++i) {
+            if (fused->srcRegIdx(i) == FuseTmpReg) {
+                fuseTmp = fused->renamedSrcIdx(i);
+                break;
+            }
+        }
+        assert(fuseTmp);
+
+        // MUL writes its result to the physical temp
+        first->renameDestReg(0, o3::VirtRegId(fuseTmp), o3::VirtRegId());
+
+        // ADD writes to the fused destination
+        second->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
+
+        // Rename MUL's source registers
+        for (int i = 0; i < firstNumSrcs; ++i) {
+            first->renameSrcReg(i, fused->extRenamedSrcIdx(i));
+        }
+
+        // Rename ADD's source registers:
+        //   whichever ADD source was rd_mul reads from FuseTmpReg (src[firstNumSrcs])
+        //   the other ADD source (accumulator) reads from src[firstNumSrcs+1]
+        if (second->srcRegIdx(0) == first->destRegIdx(0)) {
+            second->renameSrcReg(0, fused->extRenamedSrcIdx(firstNumSrcs));
+            second->renameSrcReg(1, fused->extRenamedSrcIdx(firstNumSrcs + 1));
+        } else {
+            second->renameSrcReg(1, fused->extRenamedSrcIdx(firstNumSrcs));
+            second->renameSrcReg(0, fused->extRenamedSrcIdx(firstNumSrcs + 1));
+        }
+
+        Fault fault = first->execute();
+        if (fault != NoFault) return fault;
+        return second->execute();
+    }
+};
+
 // add x1, x2, x3 + ld x1, offset(x1)
 template<int memsize>
 class AluLoadFusionInst : public FusionInst
@@ -227,6 +319,70 @@ class AluLoadFusionInst : public FusionInst
     {
         Fault fault = second->completeAcc(pkt);
         return fault;
+    }
+};
+
+// slli rd_s, rs_val, shamt + add rd_a, rd_s, rs_base + ld rd_ld, offset(rd_a)
+// EA = (rs_val << shamt) + rs_base + offset
+// Sources: [rs_val, rs_base]  Dest: rd_ld
+template<int memsize>
+class SlliAddLoadFusionInst : public FusionInst
+{
+    const o3::DynInstPtr third;
+    int shamt;
+    Request::Flags memAccessFlags;
+  public:
+    SlliAddLoadFusionInst(const char *name, OpClass op,
+                          const o3::DynInstPtr& first,
+                          const o3::DynInstPtr& second,
+                          const o3::DynInstPtr& third_inst)
+        : FusionInst(name, op, first, second), third(third_inst)
+    {
+        panic_if(first->destRegIdx(0) != second->srcRegIdx(0) &&
+                 first->destRegIdx(0) != second->srcRegIdx(1),
+                 "SlliAddLoad: SLLI dest must feed ADD");
+        panic_if(second->destRegIdx(0) != third->srcRegIdx(1),
+                 "SlliAddLoad: ADD dest must be LD base");
+        panic_if(third->destRegIdx(0) != third->srcRegIdx(0),
+                 "SlliAddLoad: LD dest must equal LD src[0]");
+
+        shamt = first->staticInst->getImm();
+        memAccessFlags = dynamic_cast<MemInst*>(third->staticInst.get())->getMemAccessFlags();
+
+        // Destination: LD's rd
+        setDestRegIdx(_numDestRegs++, third->destRegIdx(0));
+        _numTypedDestRegs[third->destRegIdx(0).classValue()]++;
+
+        // src[0] = rs_val (SLLI's source)
+        setSrcRegIdx(_numSrcRegs++, first->srcRegIdx(0));
+        // src[1] = rs_base (ADD's non-SLLI source)
+        int baseSrcIdx = (second->srcRegIdx(0) == first->destRegIdx(0)) ? 1 : 0;
+        setSrcRegIdx(_numSrcRegs++, second->srcRegIdx(baseSrcIdx));
+
+        flags = third->staticInst->getFlags();
+    }
+
+    Fault execute(ExecContext *xc, Trace::InstRecord *traceData) const override
+    {
+        panic("SlliAddLoad: execute() not implemented");
+    }
+
+    Fault initiateAcc(ExecContext *xc, Trace::InstRecord *traceData) const override
+    {
+        assert(fused);
+
+        third->renameDestReg(0, fused->extRenamedDestIdx(0), o3::VirtRegId());
+
+        uint64_t rs_val  = xc->getRegOperand(this, 0);
+        uint64_t rs_base = xc->getRegOperand(this, 1);
+        Addr EA = (rs_val << shamt) + rs_base + third->staticInst->getImm();
+
+        return initiateMemReadSize<ExecContext, memsize>(xc, traceData, EA, memAccessFlags);
+    }
+
+    Fault completeAcc(PacketPtr pkt, ExecContext *, Trace::InstRecord *) const override
+    {
+        return third->completeAcc(pkt);
     }
 };
 
@@ -320,6 +476,18 @@ alubrFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
     return new AluBrFusionInst(name, vec[0], vec[1]);
 }
 
+StaticInstPtr
+maccFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
+              std::function<bool(const std::vector<o3::DynInstPtr> &)> checker)
+{
+    if (!checker(vec)) {
+        return nullptr;  // cannot fuse
+    }
+    // Use IntMultOp so the fused instruction is routed to multiply-capable FUs
+    // (intIQ3/intIQ4) with the correct 3-cycle latency, not a plain 1-cycle ALU.
+    return new MaccFusionInst(name, IntMultOp, vec[0], vec[1]);
+}
+
 template<int memsize>
 StaticInstPtr
 aluLoadFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
@@ -329,6 +497,15 @@ aluLoadFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
         return nullptr;  // cannot fuse
     }
     return new AluLoadFusionInst<memsize>(name, vec[1]->opClass(), vec[0], vec[1]);
+}
+
+template<int memsize>
+StaticInstPtr
+slliAddLoadFuseInsts(const char *name, const std::vector<o3::DynInstPtr> &vec,
+                     std::function<bool(const std::vector<o3::DynInstPtr> &)> checker)
+{
+    if (!checker(vec)) return nullptr;
+    return new SlliAddLoadFusionInst<memsize>(name, vec[2]->opClass(), vec[0], vec[1], vec[2]);
 }
 
 template<int memsize>
@@ -353,6 +530,7 @@ const std::unordered_map<std::type_index, std::type_index> deCompressMap = {
     {typeid(RiscvISAInst::C_andi), typeid(RiscvISAInst::Andi)},
     {typeid(RiscvISAInst::C_or), typeid(RiscvISAInst::Or)},
     {typeid(RiscvISAInst::C_xor), typeid(RiscvISAInst::Xor)},
+    {typeid(RiscvISAInst::C_mul), typeid(RiscvISAInst::Mul)},
     {typeid(RiscvISAInst::C_zext_h), typeid(RiscvISAInst::Zext_h)},
     {typeid(RiscvISAInst::C_sext_h), typeid(RiscvISAInst::Sext_h)},
     {typeid(RiscvISAInst::C_lui), typeid(RiscvISAInst::Lui)},
@@ -375,11 +553,15 @@ const std::unordered_map<std::type_index, std::type_index> deCompressMap = {
 #define AluBrCreator(n, ...) \
 [](const std::vector<o3::DynInstPtr>& vec) { return alubrFuseInsts(n, std::move(vec), \
 [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
+#define MaccCreator(n, ...) [](const std::vector<o3::DynInstPtr>& vec) { return maccFuseInsts(n, std::move(vec), [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
 #define AluLdCreator(n, s, ...) \
 [](const std::vector<o3::DynInstPtr>& vec) { return aluLoadFuseInsts<s>(n, std::move(vec), \
 [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
 #define SeqLdCreator(n, s, ...) \
 [](const std::vector<o3::DynInstPtr>& vec) { return seqLoadFuseInsts<s>(n, std::move(vec), \
+[](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
+#define SlliAddLdCreator(n, s, ...) \
+[](const std::vector<o3::DynInstPtr>& vec) { return slliAddLoadFuseInsts<s>(n, std::move(vec), \
 [](const std::vector<o3::DynInstPtr>& vec) { return __VA_ARGS__ ;}); }
 
 #define FirstDest0EqualSecond(a, b) (a->destRegIdx(0) == b->destRegIdx(0))
@@ -492,6 +674,18 @@ const FusionTag fusionMap = {
          {AnyImmKey(Lw), AluLdCreator("farlw", 4, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
          {AnyImmKey(Lh), AluLdCreator("farlh", 2, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
          {AnyImmKey(Lb), AluLdCreator("farlb", 1, FirstDest0EqualSecond(vec[0], vec[1]) && Dest0EqualSrc0(vec[1]))},
+     }},
+
+    // multiply-accumulate: MUL/MULW result consumed by ADD/ADDW (any destination)
+    {AnyImmKey(Mul),
+     new FusionTag{
+         {AnyImmKey(Add),  MaccCreator("muladd",  Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
+         {AnyImmKey(Addw), MaccCreator("muladdw", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
+     }},
+    {AnyImmKey(Mulw),
+     new FusionTag{
+         {AnyImmKey(Add),  MaccCreator("mulwadd",  Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
+         {AnyImmKey(Addw), MaccCreator("mulwaddw", Dest0EqualSecondSrc0or1(vec[0], vec[1]))},
      }},
 
     // logic
@@ -615,6 +809,35 @@ const FusionTag fusionMap = {
     }},
 };
 
+
+// SLLI+ADD+LD/ST triple fusion: slli rd, rs, N + add rd2, rd, rb + ld rd3, off(rd2)
+// Condition: SLLI dest feeds ADD, ADD dest is LD base register
+#define SlliAddLdCheck() \
+    ((vec[0]->destRegIdx(0) == vec[1]->srcRegIdx(0) || \
+      vec[0]->destRegIdx(0) == vec[1]->srcRegIdx(1)) && \
+     vec[1]->destRegIdx(0) == vec[2]->srcRegIdx(1) && \
+     vec[2]->destRegIdx(0) == vec[2]->srcRegIdx(0))
+
+#define SlliAddLdEntry(shamt) \
+    {ImmKey(Slli, shamt), new FusionTag{ \
+        {AnyImmKey(Add), new FusionTag{ \
+            {AnyImmKey(Ld), SlliAddLdCreator("sll" #shamt "addld", 8, SlliAddLdCheck())}, \
+            {AnyImmKey(Lw), SlliAddLdCreator("sll" #shamt "addlw", 4, SlliAddLdCheck())}, \
+            {AnyImmKey(Lh), SlliAddLdCreator("sll" #shamt "addlh", 2, SlliAddLdCheck())}, \
+            {AnyImmKey(Lb), SlliAddLdCreator("sll" #shamt "addlb", 1, SlliAddLdCheck())}, \
+        }}, \
+    }}
+
+const FusionTag fusionMap3 = {
+    SlliAddLdEntry(1),
+    SlliAddLdEntry(2),
+    SlliAddLdEntry(3),
+    SlliAddLdEntry(4),
+    SlliAddLdEntry(5),
+    SlliAddLdEntry(6),
+    SlliAddLdEntry(7),
+    SlliAddLdEntry(8),
+};
 
 }
 }
