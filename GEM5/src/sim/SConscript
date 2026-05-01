@@ -93,6 +93,8 @@ Source('mem_pool.cc')
 Source('arch_db.cc')
 Source('rolling.cc')
 env.Append(LIBS=['sqlite3'])
+env.Append(CPPPATH=[Dir('#/ext/sqlite3')])
+env.Append(LIBPATH=[Dir('#/ext/sqlite3')])
 
 env.TagImplies('gem5 drain', ['gem5 events', 'gem5 trace'])
 env.TagImplies('gem5 events', ['gem5 serialize', 'gem5 trace'])

@@ -919,10 +919,13 @@ BaseCPU::diffWithNEMU(ThreadID tid, InstSeqNum seq)
     } else {
         // difftest step start
         DPRINTF(Diff, "Step NEMU\n");
-        diffAllStates->proxy->exec(1);
+        int nemu_steps = 1;
         if (diffInfo.inst->isFusion()) {
-            diffAllStates->proxy->exec(1); // execute the second part of the fusion
+            auto *fi = dynamic_cast<RiscvISA::FusionInst *>(diffInfo.inst.get());
+            nemu_steps = fi ? fi->numFusedParts() : 2;
         }
+        for (int _i = 0; _i < nemu_steps; ++_i)
+            diffAllStates->proxy->exec(1);
         diffAllStates->proxy->regcpy(diffAllStates->diff.nemu_reg, REF_TO_DIFFTEST);
 
         uint64_t next_pc = diffAllStates->diff.nemu_reg->pc;

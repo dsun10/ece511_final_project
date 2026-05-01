@@ -181,6 +181,7 @@ if __name__ == '__m5_main__':
     FutureClass = None
 
     args = xiangshan_system_init()
+    #args.enable_difftest = False
 
     assert not args.external_memory_system
 

@@ -47,6 +47,8 @@ class FusionInst : public RiscvStaticInst
     bool getSecondBranching() const;
     o3::DynInstPtr getSecondInst() const;
 
+    virtual int numFusedParts() const { return 2; }
+
     std::string generateDisassembly(Addr pc, const loader::SymbolTable *symtab) const override {
         std::string str = std::string(mnemonic);
         for (int i=0; i < _numDestRegs; i++) {

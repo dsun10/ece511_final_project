@@ -384,6 +384,8 @@ class SlliAddLoadFusionInst : public FusionInst
     {
         return third->completeAcc(pkt);
     }
+
+    int numFusedParts() const override { return 3; }
 };
 
 // ld x1, offset(x2) + ld x3, offset + 8(x2)
