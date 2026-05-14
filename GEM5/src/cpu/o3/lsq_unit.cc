@@ -2931,6 +2931,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
     if (request) {
         request->SQforwardPackets.clear();
+        request->SBforwardPackets.clear();
     }
 
     // Check the SQ for any previous stores that might lead to forwarding

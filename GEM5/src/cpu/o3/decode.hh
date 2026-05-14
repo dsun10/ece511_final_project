@@ -144,6 +144,7 @@ class Decode
     void checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur);
     bool checkAndFuseTriple(std::vector<DynInstPtr> &vec, DynInstPtr& cur,
                             boost::circular_buffer<DynInstPtr>& pending);
+    bool checkAndFuseNonConsec(std::vector<DynInstPtr> &vec, DynInstPtr& cur);
 
     /** Updates overall decode status based on all of the threads' statuses. */
     void updateActivate();
@@ -277,6 +278,7 @@ class Decode
         statistics::Scalar numAbrFusedInsts;
         statistics::Scalar numMacFusedInsts;
         statistics::Scalar numTripleFusedInsts;
+        statistics::Scalar numNCSFInsts;
         statistics::Vector fusedInsts;
         /** Stat for number of times decode detected a non-control instruction
          * incorrectly predicted as a branch.

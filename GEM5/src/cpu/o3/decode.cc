@@ -152,6 +152,8 @@ Decode::DecodeStats::DecodeStats(CPU *cpu)
                "Number of multiply-accumulate fused instructions handled by decode"),
       ADD_STAT(numTripleFusedInsts, statistics::units::Count::get(),
                "Number of triple (SLLI+ADD+LD/ST) fused instructions handled by decode"),
+      ADD_STAT(numNCSFInsts, statistics::units::Count::get(),
+               "Number of non-consecutive sequential load fusions handled by decode"),
       ADD_STAT(fusedInsts, statistics::units::Count::get(),
                "Number of times decode fused instructions by type"),
       ADD_STAT(controlMispred, statistics::units::Count::get(),
@@ -621,8 +623,14 @@ Decode::decodeInsts(ThreadID tid)
             ++stats.decodedInsts;
         } else {
             checkAndFuseInsts(fusionInst, inst);
+            if (!inst->isFusion() && checkAndFuseNonConsec(fusionInst, inst)) {
+                // Fused instruction already sits at the head's slot in
+                // fusionInst; do not push the (absorbed) tail again.
+                goto ncsf_skip_push;
+            }
         }
         fusionInst.push_back(inst);
+        ncsf_skip_push:;
 
         ++toRenameIndex;
         ++stats.decodedInsts;
@@ -895,6 +903,154 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
     } else {
         fusionType[fused_inst->getMnemonic()]++;
     }
+}
+
+bool
+Decode::checkAndFuseNonConsec(std::vector<DynInstPtr> &vec, DynInstPtr &cur)
+{
+    // Only fuse load pairs; gated by the same flag as consecutive load fusion.
+    if (!enableLoadFusion) return false;
+    if (cur->faulted() || !cur->isLoad()) return false;
+    // Need at least 2 instructions already in vec so there is at least one gap
+    // instruction between a candidate head and the current tail.
+    if ((int)vec.size() < 2) return false;
+
+    auto *cur_si = cur->staticInst.get();
+    std::type_index cur_type = typeid(*cur_si);
+    {
+        auto it = RiscvISA::deCompressMap.find(cur_type);
+        if (it != RiscvISA::deCompressMap.end()) cur_type = it->second;
+    }
+
+    int n = (int)vec.size();
+
+    // Tail's destination register: no gap instruction may read or write it.
+    // Reading it would give the gap inst the tail's loaded value instead of
+    // the pre-tail value; writing it would give post-tail instructions the
+    // gap's value instead of the tail's loaded value.
+    const RegId tail_dest = cur->destRegIdx(0);
+
+    // Also reject if tail writes to its own base (equivalent to the head
+    // constraint, but for the tail's perspective).
+    if (tail_dest == cur->srcRegIdx(0)) return false;
+
+    // vec[n-1] is the instruction immediately before cur in program order.
+    // checkAndFuseInsts already tried fusing it consecutively with cur, so we
+    // only consider it here as the first gap candidate.  Check it for anything
+    // that would block all earlier candidates.
+    {
+        const DynInstPtr &back = vec[n - 1];
+        // A control-flow instruction in the gap means the tail may not execute
+        // (branch taken), so NCSF would be incorrect.
+        if (back->isControl()) return false;
+        for (int d = 0; d < back->numDestRegs(); ++d) {
+            if (back->destRegIdx(d) == cur->srcRegIdx(0))
+                return false;
+            if (back->destRegIdx(d) == tail_dest)
+                return false;
+        }
+        for (int d = 0; d < back->numSrcRegs(); ++d) {
+            if (back->srcRegIdx(d) == tail_dest)
+                return false;
+        }
+    }
+
+    // Walk backwards from n-2.  At each step we have verified that every
+    // instruction in [i+1 .. n-1] is a safe gap: no control flow, no write to
+    // cur's base register, no read/write of the tail's destination register.
+    // Any load at position i with a matching base register is a valid candidate.
+    for (int i = n - 2; i >= 0; --i) {
+        const DynInstPtr &cand = vec[i];
+        if (cand->faulted()) return false;
+
+        // Control flow in the gap: tail may not execute if the branch is taken.
+        if (cand->isControl()) return false;
+
+        // If this instruction writes to cur's base register, no head at or
+        // before position i can be safely fused with cur.
+        for (int d = 0; d < cand->numDestRegs(); ++d) {
+            if (cand->destRegIdx(d) == cur->srcRegIdx(0))
+                return false;
+            // A gap instruction writing tail's dest corrupts post-tail code.
+            if (cand->destRegIdx(d) == tail_dest)
+                return false;
+        }
+        // A gap instruction reading tail's dest would see the tail's loaded
+        // value instead of the pre-tail value.
+        for (int d = 0; d < cand->numSrcRegs(); ++d) {
+            if (cand->srcRegIdx(d) == tail_dest)
+                return false;
+        }
+
+        if (!cand->isLoad()) continue;
+
+        // SeqLoad prerequisite: same base register.
+        if (cand->srcRegIdx(0) != cur->srcRegIdx(0)) continue;
+        // Head must not overwrite its own base (prevents ld x2,0(x2) style).
+        if (cand->destRegIdx(0) == cand->srcRegIdx(0)) continue;
+
+        // Resolve cand's type through deCompressMap.
+        auto *cand_si = cand->staticInst.get();
+        std::type_index cand_type = typeid(*cand_si);
+        {
+            auto it = RiscvISA::deCompressMap.find(cand_type);
+            if (it != RiscvISA::deCompressMap.end()) cand_type = it->second;
+        }
+
+        // Two-level fusionMap lookup identical to checkAndFuseInsts.
+        auto f1 = RiscvISA::fusionMap.find(RiscvISA::FusionKey(cand_type, cand_si->getImm()));
+        if (f1 == RiscvISA::fusionMap.end()) continue;
+        assert(f1->second.index() == 1);
+
+        auto *map2 = std::get<1>(f1->second);
+        auto f2 = map2->find(RiscvISA::FusionKey(cur_type, cur_si->getImm()));
+        if (f2 == map2->end()) continue;
+        assert(f2->second.index() == 0);
+
+        auto creator = std::get<0>(f2->second);
+        const std::vector<DynInstPtr> inst_pair = {cand, cur};
+        auto fused_inst = creator(inst_pair);
+        if (!fused_inst) continue;
+
+        // Build the fused DynInst.
+        DynInst::Arrays arrays;
+        arrays.numSrcs = fused_inst->numSrcRegs();
+        arrays.numDests = fused_inst->numDestRegs();
+
+        RiscvISA::PCState thispc, predPC;
+        thispc.set(cand->getPC());
+        thispc.setNPC(cur->getNPC());
+        predPC.update(*(cur->predPC));
+
+        DynInstPtr instruction = new (arrays) DynInst(
+            arrays, fused_inst, fused_inst, thispc, predPC, cand->seqNum, cpu);
+
+        instruction->setVersion(cur->getVersion());
+        instruction->setTid(cur->threadNumber);
+        instruction->thread = cur->thread;
+        instruction->setFtqId(cur->ftqId);
+        instruction->setLoopIteration(cur->loopIteration);
+        instruction->fallThruPC = cur->fallThruPC;
+
+        instruction->instListIt = cpu->instList.insert(cand->instListIt, instruction);
+        cpu->instList.erase(cand->instListIt);
+        cpu->instList.erase(cur->instListIt);
+
+        dynamic_cast<RiscvISA::FusionInst *>(fused_inst.get())->setFusedInst(instruction);
+
+        // Place the fused instruction at the head's slot in fusionInst so that
+        // rename (and therefore the ROB) sees it before the gap instructions,
+        // preserving program order.  The tail is absorbed; the caller must NOT
+        // push cur onto fusionInst again.
+        vec[i] = instruction;
+        cur = instruction;
+
+        stats.numFusedInsts++;
+        stats.numNCSFInsts++;
+        fusionType[fused_inst->getMnemonic()]++;
+        return true;
+    }
+    return false;
 }
 
 bool

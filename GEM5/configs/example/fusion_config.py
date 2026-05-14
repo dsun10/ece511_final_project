@@ -31,14 +31,14 @@ def setKmhV3Params(args, system):
         cpu.fetchQueueSize = 64
 
         # decode
-        cpu.decodeWidth = 8
+        cpu.decodeWidth = 12
         cpu.enable_loadFusion = True
         cpu.enable_abrFusion = True
         cpu.enable_macFusion = True
         cpu.enableConstantFolding = False
 
         # rename
-        cpu.renameWidth = 8
+        cpu.renameWidth = 12
         cpu.numPhysIntRegs = 224
         cpu.numPhysFloatRegs = 256
         cpu.enable_storeSet_train = False
@@ -181,7 +181,7 @@ if __name__ == '__m5_main__':
     FutureClass = None
 
     args = xiangshan_system_init()
-    #args.enable_difftest = False
+    args.enable_difftest = False
 
     assert not args.external_memory_system
 

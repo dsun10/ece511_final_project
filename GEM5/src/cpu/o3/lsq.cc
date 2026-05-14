@@ -2016,14 +2016,24 @@ LSQ::LSQRequest::forward()
 {
     if (!isLoad() || !needWBToRegister()) return;
     DPRINTF(StoreBuffer, "sbuffer/storeQue forward data\n");
+
+    if (!SBforwardPackets.empty() || !SQforwardPackets.empty()) {
+        warn("LSQRequest::forward [sn:%llu] paddr=%#lx: SBfwd=%lu pkts SQfwd=%lu pkts\n",
+             _inst->seqNum, mainReq()->getPaddr(),
+             (unsigned long)SBforwardPackets.size(),
+             (unsigned long)SQforwardPackets.size());
+    }
+
     for (auto& p : SBforwardPackets)
     {
         _sbufferBypass = true;
+        warn("  SBfwd [sn:%llu] idx=%d byte=%#02x\n", _inst->seqNum, p.idx, p.byte);
         _inst->memData[p.idx] = p.byte;
     }
 
     for (auto& p : SQforwardPackets) {
         _sbufferBypass = true;
+        warn("  SQfwd [sn:%llu] idx=%d byte=%#02x\n", _inst->seqNum, p.idx, p.byte);
         _inst->memData[p.idx] = p.byte;
     }
 }

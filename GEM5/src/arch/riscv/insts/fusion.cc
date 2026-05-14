@@ -440,6 +440,12 @@ class SeqLoadFusionInst : public FusionInst
 
     Fault completeAcc(PacketPtr pkt, ExecContext *, Trace::InstRecord *) const override
     {
+        if (pkt && pkt->getPtr<uint8_t>()) {
+            uint64_t raw = 0;
+            memcpy(&raw, pkt->getPtr<uint8_t>(), memsize < 8 ? memsize : 8);
+            warn("SeqLoadFusion [sn:%llu] completeAcc: pkt data[0..7] = %#018x (size0=%d size1=%d)\n",
+                 fused ? fused->seqNum : 0, raw, size0, size1);
+        }
         Packet tmp(pkt->getPtr<uint8_t>(), size0);
         Fault fault = first->completeAcc(&tmp);
         if (fault != NoFault)
@@ -571,7 +577,9 @@ const std::unordered_map<std::type_index, std::type_index> deCompressMap = {
 #define Dest0EqualSrc0or1(x) ((x->destRegIdx(0) == x->srcRegIdx(0)) || (x->destRegIdx(0) == x->srcRegIdx(1)))
 #define Dest0EqualSecondSrc0or1(x, y) ((x->destRegIdx(0) == y->srcRegIdx(0)) || (x->destRegIdx(0) == y->srcRegIdx(1)))
 #define ImmIs(a, i) (a->staticInst->getImm() == (i))
-#define SeqLoadCheck() ((vec[0]->srcRegIdx(0) == vec[1]->srcRegIdx(0)) && (vec[0]->destRegIdx(0) != vec[0]->srcRegIdx(0)))
+#define SeqLoadCheck() ((vec[0]->srcRegIdx(0) == vec[1]->srcRegIdx(0)) && \
+                        (vec[0]->destRegIdx(0) != vec[0]->srcRegIdx(0)) && \
+                        (vec[0]->destRegIdx(0) != vec[1]->destRegIdx(0)))
 
 // make sure do not have the same key on different fusion tags
 const FusionTag fusionMap = {
